@@ -3,3 +3,4 @@ esp32/.vscode/c_cpp_properties.json
 data_analysis/datasets
 data_analysis/poetry.lock
 data_analysis/tf_data/
+*.h5
