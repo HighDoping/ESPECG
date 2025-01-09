@@ -1,10 +1,10 @@
 # %%
-import wfdb
 import matplotlib.pyplot as plt
+import wfdb
 
 # %%
 record = wfdb.rdrecord(
-    "mit-bih-arrhythmia-database-1.0.0/100"
+    "datasets/mit-bih-arrhythmia-database-1.0.0/100"
 )  # Replace with the actual record name
 signals = record.p_signal
 
@@ -20,7 +20,7 @@ for lead in range(num_leads):
     plt.show()
 # %%
 annotation = wfdb.rdann(
-    "mit-bih-arrhythmia-database-1.0.0/100", "atr"
+    "datasets/mit-bih-arrhythmia-database-1.0.0/100", "atr"
 )  # Replace with the actual record name
 
 plt.figure(figsize=(10, 4))
