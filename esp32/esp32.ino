@@ -1,27 +1,51 @@
 // esp32 v2.0.17
 #include <SPI.h>
 #include <TFT_eSPI.h> // Hardware-specific library v2.5.43
-#include <esp_adc_cal.h>
+
 #include <SD.h>
 #include <FS.h>
+////////////////////TFT//////////////////////
+#define ILI9341_DRIVER
 
-#include "ecgmodel.h"
-#include <tflm_esp32.h>      //v1.0.0
-#include <eloquent_tinyml.h> //v3.0.1
+#define TFT_MISO 12 // (leave TFT SDO disconnected if other SPI devices share MISO)
+#define TFT_MOSI 13
+#define TFT_SCLK 14
+#define TFT_CS 15 // Chip select control pin
+#define TFT_DC 2  // Data Command control pin
+#define TFT_RST 4 // Reset pin (could connect to RST pin)
 
-#define N_INPUTS 360
-#define N_OUTPUTS 17
-//  in future projects you may need to tweak this value: it's a trial and error process
-#define ARENA_SIZE 80 * 1024
+// Optional touch screen chip select
+#define TOUCH_CS 5 // Chip select pin (T_CS) of touch screen
 
-Eloquent::TF::Sequential<TF_NUM_OPS, ARENA_SIZE> tf;
+#define LOAD_GLCD  // Font 1. Original Adafruit 8 pixel font needs ~1820 bytes in FLASH
+#define LOAD_FONT2 // Font 2. Small 16 pixel high font, needs ~3534 bytes in FLASH, 96 characters
+#define LOAD_FONT4 // Font 4. Medium 26 pixel high font, needs ~5848 bytes in FLASH, 96 characters
+#define LOAD_FONT6 // Font 6. Large 48 pixel font, needs ~2666 bytes in FLASH, only characters 1234567890:-.apm
+#define LOAD_FONT7 // Font 7. 7 segment 48 pixel font, needs ~2438 bytes in FLASH, only characters 1234567890:.
+#define LOAD_FONT8 // Font 8. Large 75 pixel font needs ~3256 bytes in FLASH, only characters 1234567890:-.
+#define LOAD_GFXFF // FreeFonts. Include access to the 48 Adafruit_GFX free fonts FF1 to FF48 and custom fonts
+
+#define SMOOTH_FONT
+
+// TFT SPI clock frequency
+// #define SPI_FREQUENCY  20000000
+// #define SPI_FREQUENCY  27000000
+#define SPI_FREQUENCY 40000000
+// #define SPI_FREQUENCY  80000000
+
+// Optional reduced SPI frequency for reading TFT
+#define SPI_READ_FREQUENCY 16000000
+
+// SPI clock frequency for touch controller
+#define SPI_TOUCH_FREQUENCY 2500000
+
 
 // Define custom pin
-const int LO_P = 34;
 const int LO_N = 35;
+const int LO_P = 34;
 
 // Define SD card parameters
-const int SD_CS = 26;
+const int SD_CS = 17;
 const int SD_FREQ = 4000000;
 File dataFile;
 
@@ -34,24 +58,23 @@ uint64_t sample_count = 0;
 bool lead_off = false;
 
 // Define ADC parameters
-const int ADC_PIN = 33;                              // Analog input pin
-const int ref_PIN = 32;                              // Analog input pin
-const adc1_channel_t ecgChannel = ADC1_CHANNEL_5;    // ADC channel
-const adc1_channel_t refChannel = ADC1_CHANNEL_5;    // ADC channel
-const adc_bits_width_t ADC_WIDTH = ADC_WIDTH_BIT_12; // ADC resolution
-const adc_atten_t ADC_ATTEN = ADC_ATTEN_DB_12;       // ADC attenuation
-esp_adc_cal_characteristics_t adcCal;
-// #define CUSTOM_ADC // Comment this line to use the default ADC library
+const uint8_t ADC_PIN = 33;
+uint8_t adc_pins[] = {ADC_PIN};              // Analog input pin
+const uint8_t ADC_WIDTH = 12;                 // ADC resolution
+const adc_attenuation_t ADC_ATTEN = ADC_11db; // ADC attenuation
 
 // Define timer interrupt parameters
-const int SAMPLE_RATE = 200;                          // Sample rate in Hz (e.g., 1000 samples per second)
-hw_timer_t *timer = NULL;                             // Timer object
-portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED; // Timer interrupt mutex
-
+const int SAMPLE_RATE = 20000; // Sample rate in Hz (e.g., 1000 samples per second)
+#define CONVERSIONS_PER_PIN 5
 // Define interrupt buffer variables
+
 #define BUFFER_SIZE 256
 
-volatile int buffer[BUFFER_SIZE];
+uint8_t adc_pins_count = sizeof(adc_pins) / sizeof(uint8_t);
+volatile bool adc_coversion_done = false;
+adc_continuous_data_t *adc_result_local = NULL;
+
+volatile uint32_t buffer[BUFFER_SIZE];
 volatile bool newDataAvailable = false;
 volatile uint8_t bufferIndex = 0;
 
@@ -97,45 +120,15 @@ private:
   int count_;
 };
 
-CircularBuffer predictBuffer(N_INPUTS);
-
-#ifdef CUSTOM_ADC
-#include <soc/sens_reg.h>
-#include <soc/sens_struct.h>
-int IRAM_ATTR local_adc1_read(int channel)
+// ISR Function that will be triggered when ADC conversion is done
+void ARDUINO_ISR_ATTR adcComplete()
 {
-  uint16_t adc_value;
-  SENS.sar_meas_start1.sar1_en_pad = (1 << channel); // only one channel is selected
-  while (SENS.sar_slave_addr1.meas_status != 0)
-    ;
-  SENS.sar_meas_start1.meas1_start_sar = 0;
-  SENS.sar_meas_start1.meas1_start_sar = 1;
-  while (SENS.sar_meas_start1.meas1_done_sar == 0)
-    ;
-  adc_value = SENS.sar_meas_start1.meas1_data_sar;
-  return adc_value;
-}
-
-void IRAM_ATTR onTimer()
-{
-  portENTER_CRITICAL_ISR(&timerMux);
-  int data = local_adc1_read(ecgChannel);
-  buffer[bufferIndex] = data;
-  bufferIndex = (bufferIndex + 1) % BUFFER_SIZE;
+  adc_coversion_done = true;
+  buffer[bufferIndex] = adc_result_local[0].avg_read_mvolts;
+  bufferIndex=bufferIndex+1;
   newDataAvailable = true;
-  portEXIT_CRITICAL_ISR(&timerMux);
+  adc_coversion_done = false;
 }
-#else
-void IRAM_ATTR onTimer()
-{
-  portENTER_CRITICAL_ISR(&timerMux);
-  int data = adc1_get_raw(ecgChannel);
-  buffer[bufferIndex] = data;
-  bufferIndex = (bufferIndex + 1) % BUFFER_SIZE;
-  newDataAvailable = true;
-  portEXIT_CRITICAL_ISR(&timerMux);
-}
-#endif
 
 TFT_eSPI tft = TFT_eSPI(); // Invoke custom library
 
@@ -145,18 +138,16 @@ void tft_update_line(int data);
 void sd_write(int data);
 bool openSDFile();
 bool closeSDFile();
-int readADCValue(uint32_t adc_raw);
-int predict();
 
 void setup()
 {
   Serial.begin(115200);
-  if (openSDFile())
-  {
-    // Write the CSV header
-    dataFile.println("sample_count,data");
-  }
-
+  // if (openSDFile())
+  // {
+  //   // Write the CSV header
+  //   dataFile.println("sample_count,data");
+  // }
+  Serial.println("Init TFT");
   tft.init();
   tft.setRotation(3);
   tft.setTextSize(1);
@@ -167,58 +158,53 @@ void setup()
 
   pinMode(LO_P, INPUT);
   pinMode(LO_N, INPUT);
-  pinMode(ADC_PIN, INPUT);
+  pinMode(ADC_PIN,INPUT);
+
   pinMode(0, INPUT);
+
   // Configure ADC
-  adc1_config_width(ADC_WIDTH);
-  adc1_config_channel_atten(ecgChannel, ADC_ATTEN);
+  Serial.println("Init ADC");
+  analogContinuousSetWidth(ADC_WIDTH);
+  analogContinuousSetAtten(ADC_ATTEN);
+  analogContinuous(adc_pins, adc_pins_count, CONVERSIONS_PER_PIN, SAMPLE_RATE, &adcComplete);
+  if (analogContinuousStart())
+  {
+    Serial.println("Start");
+  }
+  else
+  {
+    Serial.println("ADC Init Failed");
+  }
 
-  // Configure timer interrupt
-  timer = timerBegin(0, 80, true); // Timer 0, prescaler 80
-  timerAttachInterrupt(timer, &onTimer, true);
-  timerAlarmWrite(timer, 1000000 / SAMPLE_RATE, true); // Set the alarm to trigger at the desired sample rate (in microseconds)
-  timerAlarmEnable(timer);
-
-  // Calibrate ADC
-  esp_adc_cal_value_t adcValue = esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN, ADC_WIDTH, ESP_ADC_CAL_VAL_EFUSE_VREF, &adcCal);
-  adc1_get_raw(ecgChannel);
-
-  // check if model loaded fine
-  while (!tf.begin(ecgmodel).isOk())
-    Serial.println(tf.exception.toString());
+  // // check if model loaded fine
+  // while (!tf.begin(ecgmodel).isOk())
+  //   Serial.println(tf.exception.toString());
+  
 }
 
 void loop()
 {
-
   lead_off_detect();
-
   // Process the data if new data is available
   if (newDataAvailable)
   {
-    portENTER_CRITICAL_ISR(&timerMux);
     // Copy data from buffer for processing
-    int localBuffer[BUFFER_SIZE];
+    uint32_t localBuffer[BUFFER_SIZE];
+    // stop ISR
+    noInterrupts();
     memcpy(localBuffer, (const void *)buffer, sizeof(buffer));
+    interrupts();
     newDataAvailable = false;
     int bufferIndex_old = bufferIndex;
     bufferIndex = 0;
-    portEXIT_CRITICAL_ISR(&timerMux);
     // Process the data in localBuffer
     for (int i = 0; i < bufferIndex_old; i++)
     {
       sample_count++;
       tft_update_line(localBuffer[i]);
-      predictBuffer.push(localBuffer[i]);
-      if (dataFile)
-      {
-        sd_write(readADCValue(localBuffer[i]));
-      }
     }
+    Serial.println("New data");
 
-    // Make a prediction every time the buffer refreshes
-    int prediction = predict();
-    Serial.println(prediction);
   }
 
   // Close the file if the button is pressed
@@ -311,24 +297,3 @@ bool closeSDFile()
   return false;
 }
 
-int readADCValue(uint32_t adc_raw)
-{
-  uint32_t voltage = esp_adc_cal_raw_to_voltage(adc_raw, &adcCal);
-  return voltage;
-}
-
-int predict()
-{
-  int *raw_data = predictBuffer.read();
-  float input[N_INPUTS]; // change type to float
-  for (int i = 0; i < N_INPUTS; i++)
-  {
-    input[i] = static_cast<float>(raw_data[i]); // cast to float
-  }
-
-  while (!tf.predict(input).isOk())
-    Serial.println(tf.exception.toString());
-  Serial.print("Prediction: ");
-  Serial.println(tf.classification);
-  return tf.classification;
-}
